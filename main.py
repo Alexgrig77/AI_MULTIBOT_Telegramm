@@ -4,12 +4,14 @@
 import asyncio
 import json
 import logging
+import base64
+import io
 from typing import Optional, Tuple
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
+from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, BufferedInputFile
 from openai import AsyncOpenAI
 
 from config import (
@@ -94,6 +96,17 @@ def calculate_cost(input_tokens: int, output_tokens: int, model: str) -> Tuple[f
     
     cost_usd = (input_tokens / 1_000_000 * input_price_per_1m) + (output_tokens / 1_000_000 * output_price_per_1m)
     return cost_usd
+
+
+def truncate_caption(text: str, max_length: int = 1024) -> str:
+    """
+    Обрезает текст для подписи к изображению/видео
+    Telegram ограничивает caption до 1024 символов
+    """
+    if len(text) <= max_length:
+        return text
+    # Обрезаем и добавляем "..."
+    return text[:max_length - 3] + "..."
 
 
 def split_message(text: str, max_length: int = 4096) -> list[str]:
@@ -222,10 +235,10 @@ async def translate_prompt_to_english(prompt: str) -> str:
         return prompt
 
 
-async def generate_image(prompt: str) -> tuple[str, dict]:
+async def generate_image(prompt: str) -> tuple[str | bytes, dict]:
     """
     Генерирует изображение через проксиapi
-    Возвращает (URL изображения, метаданные)
+    Возвращает (URL изображения или bytes, метаданные)
     """
     try:
         logger.info(f"Генерация изображения с промптом: {prompt[:100]}...")
@@ -251,8 +264,9 @@ async def generate_image(prompt: str) -> tuple[str, dict]:
         logger.debug(f"Структура ответа: {type(response)}")
         logger.debug(f"Response data: {response.data if hasattr(response, 'data') else 'No data attr'}")
         
-        # Пробуем разные варианты получения URL
+        # Пробуем разные варианты получения изображения
         image_url = None
+        image_bytes = None
         
         if hasattr(response, 'data') and response.data and len(response.data) > 0:
             first_item = response.data[0]
@@ -262,27 +276,43 @@ async def generate_image(prompt: str) -> tuple[str, dict]:
             # Пробуем разные атрибуты
             if hasattr(first_item, 'url') and first_item.url:
                 image_url = first_item.url
+                logger.info("Получен URL изображения")
             elif hasattr(first_item, 'image_url') and first_item.image_url:
                 image_url = first_item.image_url
+                logger.info("Получен image_url")
             elif hasattr(first_item, 'b64_json') and first_item.b64_json:
-                # Если вернулся base64, нужно обработать отдельно
-                logger.warning("Получен base64 вместо URL")
-                image_url = None
+                # Декодируем base64
+                logger.info("Получен base64, декодирую...")
+                try:
+                    image_bytes = base64.b64decode(first_item.b64_json)
+                    logger.info(f"Base64 декодирован, размер: {len(image_bytes)} байт")
+                except Exception as e:
+                    logger.error(f"Ошибка декодирования base64: {e}")
+                    raise ValueError(f"Не удалось декодировать base64 изображение: {e}")
         elif hasattr(response, 'url') and response.url:
             image_url = response.url
+            logger.info("Получен URL из response")
         
-        if not image_url:
+        if not image_url and not image_bytes:
             # Логируем полный ответ для отладки
-            logger.error(f"Не удалось получить URL изображения. Полный ответ: {response}")
-            raise ValueError("API не вернул URL изображения. Проверьте логи для деталей.")
+            logger.error(f"Не удалось получить изображение. Полный ответ: {response}")
+            raise ValueError("API не вернул ни URL, ни base64 изображения. Проверьте логи для деталей.")
         
         metadata = {
             "model": IMAGE_MODEL,
-            "prompt": prompt
+            "prompt": prompt,
+            "format": "url" if image_url else "base64"
         }
         
-        logger.info(f"Изображение сгенерировано: {image_url}")
-        return image_url, metadata
+        # Возвращаем либо URL, либо bytes
+        if image_url:
+            logger.info(f"Изображение сгенерировано (URL): {image_url}")
+            return image_url, metadata
+        elif image_bytes:
+            logger.info(f"Изображение сгенерировано (base64), размер: {len(image_bytes)} байт")
+            return image_bytes, metadata
+        else:
+            raise ValueError("Не удалось получить изображение ни в виде URL, ни в виде base64")
         
     except Exception as e:
         logger.error(f"Ошибка генерации изображения: {e}", exc_info=True)
@@ -300,32 +330,55 @@ async def generate_video(prompt: str) -> tuple[str, dict]:
         
         logger.info(f"Генерация видео с промптом (EN): {english_prompt[:100]}...")
         
-        # Генерируем видео
-        response = await openai_client.videos.create(
-            model=VIDEO_MODEL,
-            prompt=english_prompt
-        )
+        # Используем прямой HTTP-запрос, так как OpenAI SDK может не поддерживать videos
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
         
-        # Для sora-2 может быть асинхронная генерация
-        # Проверяем, есть ли URL или нужно ждать
+        payload = {
+            "model": VIDEO_MODEL,
+            "prompt": english_prompt
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{PROXYAPI_BASE_URL}/videos",
+                headers=headers,
+                json=payload
+            ) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.error(f"Ошибка API при генерации видео: {response.status} - {error_text}")
+                    raise ValueError(f"API вернул ошибку {response.status}: {error_text}")
+                
+                data = await response.json()
+                logger.debug(f"Ответ API для видео: {data}")
+        
+        # Обрабатываем ответ
         video_url = None
         video_id = None
         
-        if hasattr(response, 'url') and response.url:
-            video_url = response.url
-        elif hasattr(response, 'id'):
-            video_id = response.id
-        elif hasattr(response, 'data') and len(response.data) > 0:
-            if hasattr(response.data[0], 'url'):
-                video_url = response.data[0].url
-            elif hasattr(response.data[0], 'id'):
-                video_id = response.data[0].id
+        # Проверяем разные варианты структуры ответа
+        if isinstance(data, dict):
+            if 'url' in data and data['url']:
+                video_url = data['url']
+            elif 'id' in data and data['id']:
+                video_id = data['id']
+            elif 'data' in data and isinstance(data['data'], list) and len(data['data']) > 0:
+                first_item = data['data'][0]
+                if isinstance(first_item, dict):
+                    if 'url' in first_item:
+                        video_url = first_item['url']
+                    elif 'id' in first_item:
+                        video_id = first_item['id']
         
         metadata = {
             "model": VIDEO_MODEL,
             "prompt": prompt,
             "english_prompt": english_prompt,
-            "video_id": video_id
+            "video_id": video_id,
+            "raw_response": data
         }
         
         logger.info(f"Видео сгенерировано. URL: {video_url}, ID: {video_id}")
@@ -509,16 +562,29 @@ async def cmd_image(message: Message):
     
     try:
         # Генерируем изображение
-        image_url, metadata = await generate_image(prompt)
+        image_data, metadata = await generate_image(prompt)
         
-        if not image_url:
-            raise ValueError("Не удалось получить URL изображения от API")
+        if not image_data:
+            raise ValueError("Не удалось получить изображение от API")
         
-        # Отправляем изображение
-        await message.answer_photo(
-            photo=image_url,
-            caption=f"🖼️ Изображение сгенерировано\n\nПромпт: {prompt}"
-        )
+        # Формируем подпись с обрезкой промпта
+        caption_text = f"🖼️ Изображение сгенерировано\n\nПромпт: {prompt}"
+        caption = truncate_caption(caption_text)
+        
+        # Проверяем, это URL или bytes
+        if isinstance(image_data, bytes):
+            # Отправляем как файл из bytes
+            photo_file = BufferedInputFile(image_data, filename="generated_image.png")
+            await message.answer_photo(
+                photo=photo_file,
+                caption=caption
+            )
+        else:
+            # Отправляем по URL
+            await message.answer_photo(
+                photo=image_data,
+                caption=caption
+            )
         
         # Удаляем сообщение о статусе
         await status_msg.delete()
@@ -607,15 +673,30 @@ async def handle_message(message: Message):
         status_msg = await message.answer("🎨 Генерирую изображение...")
         
         try:
-            image_url, metadata = await generate_image(user_message)
+            image_data, metadata = await generate_image(user_message)
             
-            if not image_url:
-                raise ValueError("Не удалось получить URL изображения от API")
+            if not image_data:
+                raise ValueError("Не удалось получить изображение от API")
             
-            await message.answer_photo(
-                photo=image_url,
-                caption=f"🖼️ Изображение сгенерировано\n\nПромпт: {user_message}"
-            )
+            # Формируем подпись с обрезкой промпта
+            caption_text = f"🖼️ Изображение сгенерировано\n\nПромпт: {user_message}"
+            caption = truncate_caption(caption_text)
+            
+            # Проверяем, это URL или bytes
+            if isinstance(image_data, bytes):
+                # Отправляем как файл из bytes
+                photo_file = BufferedInputFile(image_data, filename="generated_image.png")
+                await message.answer_photo(
+                    photo=photo_file,
+                    caption=caption
+                )
+            else:
+                # Отправляем по URL
+                await message.answer_photo(
+                    photo=image_data,
+                    caption=caption
+                )
+            
             await status_msg.delete()
             logger.info(f"Изображение отправлено пользователю {user_id}")
         except Exception as e:
