@@ -319,6 +319,65 @@ async def generate_image(prompt: str) -> tuple[str | bytes, dict]:
         raise
 
 
+async def check_video_status(video_id: str) -> tuple[str, dict]:
+    """
+    Проверяет статус генерации видео по ID
+    Возвращает (статус, данные видео)
+    """
+    try:
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{PROXYAPI_BASE_URL}/videos/{video_id}",
+                headers=headers
+            ) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.error(f"Ошибка при проверке статуса видео: {response.status} - {error_text}")
+                    return None, {}
+                
+                data = await response.json()
+                logger.debug(f"Статус видео {video_id}: {data}")
+                return data.get('status'), data
+                
+    except Exception as e:
+        logger.error(f"Ошибка проверки статуса видео: {e}", exc_info=True)
+        return None, {}
+
+
+async def get_video_content(video_id: str) -> bytes:
+    """
+    Получает готовое видео по ID
+    Возвращает bytes видео
+    """
+    try:
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}"
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{PROXYAPI_BASE_URL}/videos/{video_id}/content",
+                headers=headers
+            ) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.error(f"Ошибка при получении видео: {response.status} - {error_text}")
+                    raise ValueError(f"Не удалось получить видео: {response.status}")
+                
+                video_bytes = await response.read()
+                logger.info(f"Видео получено, размер: {len(video_bytes)} байт")
+                return video_bytes
+                
+    except Exception as e:
+        logger.error(f"Ошибка получения видео: {e}", exc_info=True)
+        raise
+
+
 async def generate_video(prompt: str) -> tuple[str, dict]:
     """
     Генерирует видео через проксиapi (sora-2)
@@ -387,6 +446,90 @@ async def generate_video(prompt: str) -> tuple[str, dict]:
     except Exception as e:
         logger.error(f"Ошибка генерации видео: {e}", exc_info=True)
         raise
+
+
+async def poll_video_status(user_id: str, chat_id: int, video_id: str, prompt: str, metadata: dict, status_msg: Message):
+    """
+    Периодически проверяет статус генерации видео и отправляет готовое видео
+    """
+    max_attempts = 60  # Максимум 5 минут (60 попыток по 5 секунд)
+    attempt = 0
+    
+    try:
+        while attempt < max_attempts:
+            await asyncio.sleep(5)  # Проверяем каждые 5 секунд
+            attempt += 1
+            
+            status, video_data = await check_video_status(video_id)
+            
+            if status is None:
+                logger.warning(f"Не удалось получить статус видео {video_id}, попытка {attempt}")
+                continue
+            
+            logger.info(f"Статус видео {video_id}: {status} (попытка {attempt}/{max_attempts})")
+            
+            if status == "completed":
+                # Видео готово, получаем его
+                try:
+                    video_bytes = await get_video_content(video_id)
+                    
+                    # Отправляем видео
+                    caption_text = f"🎬 Видео сгенерировано\n\nПромпт: {prompt}\nПереведенный промпт (EN): {metadata.get('english_prompt', 'N/A')}"
+                    caption = truncate_caption(caption_text)
+                    
+                    video_file = BufferedInputFile(video_bytes, filename="generated_video.mp4")
+                    await bot.send_video(
+                        chat_id=chat_id,
+                        video=video_file,
+                        caption=caption
+                    )
+                    
+                    await status_msg.delete()
+                    logger.info(f"Видео отправлено пользователю {user_id}")
+                    return
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка получения/отправки видео: {e}", exc_info=True)
+                    await status_msg.edit_text(
+                        f"❌ Ошибка при получении готового видео: {str(e)}"
+                    )
+                    return
+                    
+            elif status == "failed":
+                error_info = video_data.get('error', {})
+                error_msg = error_info.get('message', 'Неизвестная ошибка') if isinstance(error_info, dict) else str(error_info)
+                await status_msg.edit_text(
+                    f"❌ Генерация видео не удалась: {error_msg}"
+                )
+                logger.error(f"Генерация видео {video_id} провалилась: {error_msg}")
+                return
+                
+            elif status in ["queued", "processing"]:
+                # Обновляем статус
+                progress = video_data.get('progress', 0)
+                await status_msg.edit_text(
+                    f"⏳ Видео генерируется... ({progress}%)\n"
+                    f"ID задачи: {video_id}\n\n"
+                    f"Промпт: {prompt}\n"
+                    f"Переведенный промпт (EN): {metadata.get('english_prompt', 'N/A')}\n\n"
+                    f"⏳ Ожидаю готовности видео... (попытка {attempt}/{max_attempts})"
+                )
+            else:
+                logger.warning(f"Неизвестный статус видео: {status}")
+        
+        # Если превысили лимит попыток
+        await status_msg.edit_text(
+            f"⏱️ Превышено время ожидания генерации видео.\n"
+            f"ID задачи: {video_id}\n\n"
+            f"Попробуйте проверить статус позже или создайте новое видео."
+        )
+        logger.warning(f"Превышен лимит попыток для видео {video_id}")
+        
+    except Exception as e:
+        logger.error(f"Ошибка в poll_video_status: {e}", exc_info=True)
+        await status_msg.edit_text(
+            f"❌ Ошибка при проверке статуса видео: {str(e)}"
+        )
 
 
 @dp.message(Command("start"))
@@ -627,18 +770,27 @@ async def cmd_video(message: Message):
         # Проверяем, это URL или ID
         if video_result.startswith("video_id:"):
             video_id = video_result.replace("video_id:", "")
+            
+            # Запускаем фоновую задачу для проверки статуса
+            asyncio.create_task(
+                poll_video_status(user_id, message.chat.id, video_id, prompt, metadata, status_msg)
+            )
+            
             await status_msg.edit_text(
                 f"⏳ Видео генерируется...\n"
                 f"ID задачи: {video_id}\n\n"
                 f"Промпт: {prompt}\n"
-                f"Переведенный промпт (EN): {metadata.get('english_prompt', 'N/A')}"
+                f"Переведенный промпт (EN): {metadata.get('english_prompt', 'N/A')}\n\n"
+                f"⏳ Ожидаю готовности видео..."
             )
             logger.info(f"Видео в процессе генерации для пользователя {user_id}, ID: {video_id}")
         else:
             # Если есть URL, отправляем видео
+            caption_text = f"🎬 Видео сгенерировано\n\nПромпт: {prompt}\nПереведенный промпт (EN): {metadata.get('english_prompt', 'N/A')}"
+            caption = truncate_caption(caption_text)
             await message.answer_video(
                 video=video_result,
-                caption=f"🎬 Видео сгенерировано\n\nПромпт: {prompt}\nПереведенный промпт (EN): {metadata.get('english_prompt', 'N/A')}"
+                caption=caption
             )
             await status_msg.delete()
             logger.info(f"Видео отправлено пользователю {user_id}")
@@ -716,17 +868,27 @@ async def handle_message(message: Message):
             
             if video_result.startswith("video_id:"):
                 video_id = video_result.replace("video_id:", "")
+                
+                # Запускаем фоновую задачу для проверки статуса
+                asyncio.create_task(
+                    poll_video_status(user_id, message.chat.id, video_id, user_message, metadata, status_msg)
+                )
+                
                 await status_msg.edit_text(
                     f"⏳ Видео генерируется...\n"
                     f"ID задачи: {video_id}\n\n"
                     f"Промпт: {user_message}\n"
-                    f"Переведенный промпт (EN): {metadata.get('english_prompt', 'N/A')}"
+                    f"Переведенный промпт (EN): {metadata.get('english_prompt', 'N/A')}\n\n"
+                    f"⏳ Ожидаю готовности видео..."
                 )
                 logger.info(f"Видео в процессе генерации для пользователя {user_id}, ID: {video_id}")
             else:
+                # Если сразу получили URL
+                caption_text = f"🎬 Видео сгенерировано\n\nПромпт: {user_message}\nПереведенный промпт (EN): {metadata.get('english_prompt', 'N/A')}"
+                caption = truncate_caption(caption_text)
                 await message.answer_video(
                     video=video_result,
-                    caption=f"🎬 Видео сгенерировано\n\nПромпт: {user_message}\nПереведенный промпт (EN): {metadata.get('english_prompt', 'N/A')}"
+                    caption=caption
                 )
                 await status_msg.delete()
                 logger.info(f"Видео отправлено пользователю {user_id}")
